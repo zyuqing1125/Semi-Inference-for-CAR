@@ -1,0 +1,878 @@
+---
+title: "Treatment-effect variance and Type I error"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    code_folding: hide
+    df_print: paged
+    self_contained: true
+params:
+  results_dir: "."
+  file_pattern: "^seed[0-9]+[.][Rr][Dd][Aa][Tt][Aa]$"
+  output_dir: "variance_type1_conditionalX2_gexp_plots"
+  scenarios: ["i", "ii", "iii"]
+  n_min: 300
+  n_max: 2100
+  alpha: 0.05
+  null_value: 0
+  mc_conf_level: 0.95
+  band_alpha: 0.18
+  invalid_policy: "report"
+  check_scenario2_settings: true
+  variance_y_min: 0.7
+  variance_y_max: 1.2
+  type1_y_max: 0.115
+  save_pdf: true
+  save_plot_object: true
+---
+
+```{r setup, include=FALSE}
+# Workflow: validate settings -> read and audit saved rows -> summarize ratios/tests
+# -> build g2 -> export figures, tables, and reproducibility records.
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+  fig.width = 12, fig.height = 9, out.width = "100%", fig.align = "center", dpi = 160)
+needed <- c("ggplot2", "patchwork")
+missing <- needed[!vapply(needed, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing)) stop("Install these packages before knitting: ",
+  paste(missing, collapse = ", "), ". For example: install.packages(c('ggplot2', 'patchwork')).")
+if (utils::packageVersion("ggplot2") < "3.4.0") stop("ggplot2 >= 3.4.0 is required.")
+library(ggplot2)
+# Knitting supplies params from YAML. These defaults also permit Run All / Run
+# Above in an interactive R session, so the plot object g2 remains in that session.
+default_params <- list(
+  results_dir = ".",
+  file_pattern = "^seed[0-9]+[.][Rr][Dd][Aa][Tt][Aa]$",
+  output_dir = "variance_type1_conditionalX2_gexp_plots",
+  scenarios = c("i", "ii", "iii"), n_min = 300, n_max = 2100,
+  alpha = 0.05, null_value = 0, mc_conf_level = 0.95, band_alpha = 0.18,
+  invalid_policy = "report", check_scenario2_settings = TRUE,
+  variance_y_min = 0.7, variance_y_max = 1.2, type1_y_max = 0.115,
+  save_pdf = TRUE, save_plot_object = TRUE
+)
+if (!exists("params", inherits = FALSE)) params <- default_params
+# Do not replace explicitly supplied NULL values: these select automatic axes.
+for (nm in setdiff(names(default_params), names(params))) params[nm] <- default_params[nm]
+options(width = 100)
+#' Validate a probability-valued report setting
+#'
+#' Check that an input is one finite numeric probability strictly between zero and one.
+#'
+#' @param x Value to check.
+#' @return Scalar logical TRUE if all checks pass, FALSE otherwise.
+is_prob <- function(x) is.numeric(x) && length(x) == 1L && is.finite(x) && x > 0 && x < 1
+#' Validate a finite numeric scalar setting
+#'
+#' Check numeric type, scalar length, and finiteness.
+#'
+#' @param x Value to check.
+#' @return Scalar logical TRUE for one finite numeric value, FALSE otherwise.
+is_scalar <- function(x) is.numeric(x) && length(x) == 1L && is.finite(x)
+stopifnot(is_prob(params$alpha), is_prob(params$mc_conf_level),
+  is_scalar(params$null_value), is_scalar(params$band_alpha),
+  params$band_alpha > 0, params$band_alpha <= 1,
+  is_scalar(params$n_min), is_scalar(params$n_max), params$n_min >= 1,
+  params$n_max >= params$n_min, params$invalid_policy %in% c("report", "stop"),
+  is.logical(params$save_pdf), length(params$save_pdf) == 1L, !is.na(params$save_pdf),
+  is.logical(params$save_plot_object), length(params$save_plot_object) == 1L,
+  !is.na(params$save_plot_object))
+scenario_levels <- c("i", "ii", "iii")
+selected_scenarios <- scenario_levels[scenario_levels %in% unlist(params$scenarios)]
+if (!length(selected_scenarios) || any(!unlist(params$scenarios) %in% scenario_levels))
+  stop("params$scenarios must contain one or more of 'i', 'ii', 'iii'.")
+if (xor(is.null(params$variance_y_min), is.null(params$variance_y_max)))
+  stop("Set both variance_y_min and variance_y_max, or leave both null.")
+if (!is.null(params$variance_y_min)) stopifnot(is_scalar(params$variance_y_min),
+  is_scalar(params$variance_y_max), params$variance_y_max > params$variance_y_min)
+
+if (!is.null(params$type1_y_max)) stopifnot(is_scalar(params$type1_y_max),
+  params$type1_y_max > params$alpha, params$type1_y_max <= 1)
+
+# Relative paths are resolved from the Rmd directory. Interactive chunks fall
+# back to the working directory when knitr has no current input.
+rmd_input <- knitr::current_input(dir = TRUE)
+report_dir <- if (length(rmd_input) == 1L && !is.na(rmd_input) &&
+  nzchar(rmd_input) && file.exists(rmd_input)) dirname(normalizePath(rmd_input)) else getwd()
+#' Resolve report input and output paths
+#'
+#' Expand a home-directory prefix and anchor relative paths to report_dir.
+#'
+#' @param path Nonempty character scalar path, relative or absolute.
+#' @return Character resolved path; invalid path strings cause an error.
+#' @details Uses report_dir from setup. It does not require the target to exist or
+#'   normalize away relative path components.
+resolve_path <- function(path) {
+  if (!is.character(path) || length(path) != 1L || is.na(path) || !nzchar(path))
+    stop("Input and output paths must be nonempty strings.")
+  path <- path.expand(path)
+  absolute <- grepl("^(/|[A-Za-z]:[/\\\\]|\\\\\\\\)", path)
+  if (absolute) path else file.path(report_dir, path)
+}
+input_path <- resolve_path(params$results_dir)
+output_path <- resolve_path(params$output_dir)
+dir.create(output_path, recursive = TRUE, showWarnings = FALSE)
+if (!dir.exists(output_path)) stop("Cannot create output directory: ", output_path)
+output_path <- normalizePath(output_path, winslash = "/", mustWork = TRUE)
+#' Export a report table as CSV
+#'
+#' Write one analysis or audit table into the configured output directory.
+#'
+#' @param x Data frame or table object accepted by write.csv().
+#' @param filename Character file name within output_path.
+#' @return NULL invisibly; creates or replaces the named CSV file.
+#' @details Uses output_path from setup; omits row names and writes missing entries as
+#'   NA.
+write_table <- function(x, filename) utils::write.csv(x, file.path(output_path, filename),
+  row.names = FALSE, na = "NA")
+method_levels <- c("Proposed-t-test", "Proposed-lm")
+method_labels <- c("Two-sample t-test", "Linear working model")
+normal_mc_quantile <- stats::qnorm((1 + params$mc_conf_level) / 2)
+critical_value <- stats::qnorm(1 - params$alpha / 2)
+```
+
+## Input and interpretation
+
+Place this Rmd in the **same directory** as `seed1.RData`, `seed2.RData`, and so on,
+and click **Knit**. No simulation source file or helper script is required for this
+report. It only reads saved outputs: it does **not** regenerate observations,
+treatment assignments, or bootstrap samples.
+
+This report is matched to
+`simu_variance_one_seed_2100_s2_conditionalX2_gexp_order3_knot0.R`.
+Its Scenario (ii) has $X\sim N(0,1)$ conditional on $-2<X<2$ and
+$g(X)=e^X$. Its balancing splines have order three (degree two), one fixed
+interior knot at zero for every sample size, and boundary knots $-2$ and $2$.
+Scenarios (i) and (iii) are also included, with their settings unchanged by this
+report.
+There is **no one/two/three-knot schedule check** in this report.
+Recorded metadata are checked against the conditional-normal, fixed-zero-knot
+settings; this does not retrospectively verify how the observations were generated.
+
+The main figure contains treatment-effect **variance ratios in the upper row**
+and **Type I error in the lower row**, with one column per selected scenario.
+The combined figure uses grey scenario strips, coral circles/solid lines for the
+two-sample $t$-test, teal triangles/dashed lines for the linear working model,
+transparent bands, and a single legend below both rows, as in the example.
+Only the full treatment-effect variances are plotted, not the separate bootstrap
+imbalance components. The shaded regions connect pointwise Monte Carlo confidence
+intervals at the observed sample sizes; they are not simultaneous confidence bands.
+
+For the CSV output of the same simulation script, change `file_pattern` to
+`"^variance_seed_[0-9]+[.]csv$"`. Alternatively, `results_dir` may point to one combined
+`.RData`, `.rds`, or `.csv` file. Do not load both RData and CSV copies of the same
+repetitions. Keep different simulation designs in separate directories.
+
+**This file expects the data-frame outputs of the attached variance-study script.**
+It does not accept the rejection-indicator vectors returned by the separate
+`simu_ball_corrected_s2_conditionalX2_gexp.R` or
+`simu_updated_empirical_bootstrap_s2_conditionalX2_gexp.R` scripts.
+
+## Read and validate results
+
+```{r read-results}
+#' Recognize a variance-study data frame
+#'
+#' Check for the core repetition, scenario, trial-size, and method columns.
+#'
+#' @param x Object to inspect.
+#' @return Scalar logical indicating whether x is a data frame with replicate, scenario,
+#'   n, and method columns.
+#' @details This checks shape and column names only; numeric values and settings are
+#'   validated later.
+looks_like_results <- function(x) is.data.frame(x) &&
+  all(c("replicate", "scenario", "n", "method") %in% names(x))
+#' Read one saved variance-study result file
+#'
+#' Load compatible RData/rda, RDS, or CSV results without regenerating any simulation
+#' data.
+#'
+#' @param path Character scalar path to a saved result file.
+#' @return Compatible result data frame, preserving its saved rows and columns;
+#'   unsupported or ambiguous inputs cause an error.
+#' @details For RData files, loads into a private environment, prefers a compatible
+#'   object res1, and otherwise requires exactly one compatible data frame. Rejection-
+#'   indicator vectors are rejected.
+read_one <- function(path) {
+  ext <- tolower(tools::file_ext(path))
+  if (ext %in% c("rdata", "rda")) {
+    env <- new.env(parent = emptyenv())
+    objects <- load(path, envir = env)
+    # Candidate callback: nm is a loaded object name; returns TRUE for a compatible result
+    # data frame.
+    candidates <- objects[vapply(objects, function(nm) looks_like_results(env[[nm]]), logical(1))]
+    if ("res1" %in% candidates) x <- env[["res1"]] else {
+      if (length(candidates) != 1L) stop("Expected res1 or one compatible data frame in ", path,
+        ". A numeric rejection vector is not a variance-study result.")
+      x <- env[[candidates]]
+    }
+  } else if (ext == "rds") x <- readRDS(path) else if (ext == "csv") {
+    x <- utils::read.csv(path, stringsAsFactors = FALSE, check.names = FALSE)
+  } else stop("Unsupported input extension in ", path)
+  if (!looks_like_results(x)) stop("Not a variance-study data frame: ", path)
+  x
+}
+#' Convert a result column to numeric without hiding conversion failures
+#'
+#' Convert factor labels or saved values and check whether nonmissing inputs became NA.
+#'
+#' @param x Column vector to convert.
+#' @param name Column name used in error messages.
+#' @param path Input file or diagnostic label used in errors.
+#' @return Numeric vector of the same length, retaining pre-existing missing values;
+#'   invalid conversions cause an error.
+#' @details Finiteness is checked separately at the relevant analysis stage.
+as_num <- function(x, name, path) {
+  if (is.factor(x)) x <- as.character(x)
+  out <- suppressWarnings(as.numeric(x))
+  if (any(!is.na(x) & is.na(out))) stop("Non-numeric ", name, " in ", path)
+  out
+}
+#' Read a numeric column through compatible saved aliases
+#'
+#' Select a supported column name and verify that multiple aliases agree.
+#'
+#' @param x Input result data frame.
+#' @param aliases Character vector of accepted column names in preference order.
+#' @param path Input path or diagnostic label used in errors.
+#' @param required Logical flag; default TRUE requires at least one alias.
+#' @return Numeric column vector; if optional and absent, a length-nrow(x) vector of
+#'   NA_real_. Missing required columns or inconsistent aliases cause an error.
+#' @details Uses as_num() and an all.equal() tolerance of 1e-10 for multiple present
+#'   aliases.
+pick_num <- function(x, aliases, path, required = TRUE) {
+  present <- aliases[aliases %in% names(x)]
+  if (!length(present)) {
+    if (required) stop("Missing ", paste(aliases, collapse = " / "), " in ", path)
+    return(rep(NA_real_, nrow(x)))
+  }
+  # Alias callback: nm is one present column name; returns its validated numeric column.
+  values <- lapply(present, function(nm) as_num(x[[nm]], nm, path))
+  if (length(values) > 1L) for (j in 2:length(values)) {
+    if (!isTRUE(all.equal(values[[1]], values[[j]], tolerance = 1e-10,
+                         check.attributes = FALSE)))
+      stop("Alias columns disagree: ", paste(present, collapse = ", "), " in ", path)
+  }
+  values[[1]]
+}
+metadata_names <- c("study", "code_id", "B", "base_seed", "backend", "quadrature", "edge_grid",
+  "R_version", "mgcv_version", "MASS_version", "splines2_version", "Rcpp_version",
+  "outer_seed", "bootstrap_seed", "reference_seed", "scenario2_interior_knots",
+  "scenario2_knot_location", "scenario2_knot_rule", "scenario2_X_transform",
+  "scenario2_X_lower", "scenario2_X_upper", "scenario2_g_function",
+  "scenario2_spline_order", "scenario2_spline_degree", "scenario2_feature_dimension")
+#' Normalize saved result columns and verify variance scaling
+#'
+#' Construct a common result layout, retain metadata, and check aliases plus the 4/n
+#' component decomposition.
+#'
+#' @param x Compatible data frame read from one input file.
+#' @param path Source file path used for diagnostics and provenance.
+#' @return Data frame containing identifiers, effect, three treatment estimate/variance
+#'   columns, status/error/warnings, source_file, metadata, and optional
+#'   base/sigma_E/sigma_m/adjusted_sigma2 columns.
+#' @details Uses metadata_names from the surrounding chunk. Where finite components are
+#'   available, checks treatment_variance = 4*adjusted_sigma2/n =
+#'   4*(base+sigma_E+sigma_m)/n. Missing optional columns remain NA and are not inferred.
+standardize <- function(x, path) {
+  if (!"effect" %in% names(x)) stop("Missing effect in ", path, "; cannot verify null simulations.")
+  out <- data.frame(replicate = as_num(x$replicate, "replicate", path),
+    scenario = as.character(x$scenario), n = as_num(x$n, "n", path),
+    method = as.character(x$method), effect = as_num(x$effect, "effect", path),
+    treatment_estimate = pick_num(x, c("treatment_estimate", "estimate"), path),
+    treatment_variance = pick_num(x, c("treatment_variance", "variance"), path),
+    mc_treatment_estimate = pick_num(x, c("mc_treatment_estimate", "mc_estimate"), path),
+    status = if ("status" %in% names(x)) as.character(x$status) else "ok",
+    error = if ("error" %in% names(x)) as.character(x$error) else "",
+    warnings = if ("warnings" %in% names(x)) as.character(x$warnings) else "",
+    source_file = path, stringsAsFactors = FALSE)
+  for (nm in metadata_names) out[[nm]] <- if (nm %in% names(x))
+    as.character(x[[nm]]) else rep(NA_character_, nrow(x))
+  for (nm in c("base", "sigma_E", "sigma_m", "adjusted_sigma2"))
+    out[[nm]] <- pick_num(x, nm, path, required = FALSE)
+  expected <- 4 / out$n * out$adjusted_sigma2
+  ok <- is.finite(expected) & is.finite(out$treatment_variance)
+  if (any(abs(expected[ok] - out$treatment_variance[ok]) >
+      1e-9 * pmax(1, abs(expected[ok]), abs(out$treatment_variance[ok]))))
+    stop("The 4/n variance-scale check failed in ", path)
+  from_components <- 4 / out$n * (out$base + out$sigma_E + out$sigma_m)
+  ok <- is.finite(from_components) & is.finite(out$treatment_variance)
+  if (any(abs(from_components[ok] - out$treatment_variance[ok]) >
+      1e-9 * pmax(1, abs(from_components[ok]), abs(out$treatment_variance[ok]))))
+    stop("Saved full variance does not match base + sigma_E + sigma_m in ", path)
+  out
+}
+if (dir.exists(input_path)) {
+  input_files <- list.files(input_path, pattern = params$file_pattern,
+    full.names = TRUE, recursive = FALSE)
+  input_files <- input_files[!dir.exists(input_files)]
+} else if (file.exists(input_path)) input_files <- input_path else stop("Input not found: ", input_path)
+if (!length(input_files)) stop("No seed files matched in ", input_path,
+  ". Place this Rmd beside the saved seed*.RData files, not just beside the R source. ",
+  "This report does not run delta() or generate new simulation datasets.")
+input_files <- sort(normalizePath(input_files, winslash = "/", mustWork = TRUE))
+write_table(data.frame(path = input_files, bytes = file.info(input_files)$size), "input_manifest.csv")
+# Input callback: p is one file path; returns its standardized data frame before stacking
+# rows.
+results <- do.call(rbind, lapply(input_files, function(p) standardize(read_one(p), p)))
+rownames(results) <- NULL
+if (anyNA(results$scenario) || anyNA(results$method) ||
+    any(!results$scenario %in% scenario_levels) || any(!results$method %in% method_levels))
+  stop("Unexpected scenario/method labels. Expected i/ii/iii and Proposed-t-test/Proposed-lm.")
+if (any(!is.finite(results$n) | results$n < 1 | results$n != floor(results$n)) ||
+    any(!is.finite(results$replicate) | results$replicate < 1 |
+        results$replicate != floor(results$replicate))) stop("Invalid n or repetition identifier.")
+results <- results[results$scenario %in% selected_scenarios &
+  results$n >= params$n_min & results$n <= params$n_max, , drop = FALSE]
+if (!nrow(results)) stop("No rows remain for the selected scenarios/sample-size range.")
+key <- paste(results$replicate, results$scenario, results$n, results$method, sep = "|")
+dup <- duplicated(key) | duplicated(key, fromLast = TRUE)
+if (any(dup)) {
+  write_table(results[dup, , drop = FALSE], "duplicate_rows.csv")
+  stop("Duplicate repetition/scenario/n/method rows; inspect duplicate_rows.csv.")
+}
+if (any(!is.finite(results$effect)) ||
+    any(abs(results$effect - params$null_value) > 1e-10 * max(1, abs(params$null_value))))
+  stop("The saved true effects do not all equal null_value. Do not label power as Type I error.")
+
+# Never pool different implementations, bootstrap sizes, seeds, or fitting versions.
+for (nm in c("study", "code_id", "B", "base_seed", "backend", "quadrature", "edge_grid",
+             "R_version", "mgcv_version", "MASS_version", "splines2_version", "Rcpp_version")) {
+  nonempty <- !is.na(results[[nm]]) & nzchar(results[[nm]])
+  if (any(nonempty) && !all(nonempty)) stop("Partly missing metadata: ", nm)
+  vals <- unique(results[[nm]][nonempty])
+  if (length(vals) > 1L) stop("Mixed ", nm, " values. Analyze each batch separately.")
+}
+expected_study <- "empirical_X_only_variance_v8_2100_s2_conditionalX2_gexp_order3_knot0"
+if (isTRUE(params$check_scenario2_settings)) {
+  supplied_study <- unique(results$study[!is.na(results$study)])
+  if (length(supplied_study) && any(supplied_study != expected_study))
+    stop("These files have a different study identifier. This report is for ", expected_study,
+      ". Do not mix clipped-X, transformed-X, or increasing-knot runs.")
+  ii <- results$scenario == "ii"
+  if (any(ii)) {
+    checks <- list(scenario2_interior_knots = 1, scenario2_knot_location = 0,
+      scenario2_X_lower = -2, scenario2_X_upper = 2,
+      scenario2_spline_order = 3, scenario2_spline_degree = 2,
+      scenario2_feature_dimension = 4)
+    missing_checks <- character()
+    for (nm in names(checks)) {
+      raw <- results[[nm]][ii]
+      if (all(is.na(raw))) { missing_checks <- c(missing_checks, nm); next }
+      value <- as_num(raw, nm, "Scenario (ii) metadata")
+      if (any(!is.finite(value)) || any(abs(value - checks[[nm]]) > 1e-10))
+        stop("Scenario (ii) metadata mismatch: ", nm, " must be ", checks[[nm]], ".")
+    }
+    text_checks <- c(scenario2_X_transform = "conditional_normal[-2,2]",
+      scenario2_knot_rule = "fixed_zero", scenario2_g_function = "exp(X)")
+    for (nm in names(text_checks)) {
+      value <- results[[nm]][ii]
+      target <- unname(text_checks[nm])
+      if (all(is.na(value))) missing_checks <- c(missing_checks, nm) else
+        if (anyNA(value) || any(value != target)) stop("Scenario (ii) metadata mismatch: ", nm,
+          "; expected ", target, ".")
+    }
+    if (length(missing_checks)) warning("Could not verify missing Scenario (ii) metadata: ",
+      paste(missing_checks, collapse = ", "), ". No values were inferred.")
+  }
+}
+write_table(unique(results[, c("scenario", "n", metadata_names[grepl("^scenario2_", metadata_names)])]),
+  "scenario2_settings.csv")
+
+# Check seed overlap across experiments, allowing the two methods to share a trial.
+seed_records <- unique(results[, c("replicate", "scenario", "n", "outer_seed", "reference_seed")])
+outer_seeds <- seed_records$outer_seed[!is.na(seed_records$outer_seed)]
+reference_seeds <- seed_records$reference_seed[!is.na(seed_records$reference_seed)]
+if (anyDuplicated(outer_seeds) || anyDuplicated(reference_seeds) ||
+    length(intersect(outer_seeds, reference_seeds)))
+  stop("Repeated or overlapping original/reference trial seeds detected; cannot assume independent references.")
+
+status_ok <- !is.na(results$status) & results$status == "ok"
+results$variance_evaluable <- status_ok & is.finite(results$treatment_variance)
+results$reference_evaluable <- status_ok & is.finite(results$mc_treatment_estimate)
+results$estimate_evaluable <- status_ok & is.finite(results$treatment_estimate)
+# A finite positive saved contrast variance is required to define the normal test.
+results$test_evaluable <- results$estimate_evaluable & results$variance_evaluable &
+  results$treatment_variance > 0
+results$test_statistic <- rep(NA_real_, nrow(results))
+results$reject <- rep(NA, nrow(results))
+ok <- results$test_evaluable
+results$test_statistic[ok] <- (results$treatment_estimate[ok] - params$null_value) /
+  sqrt(results$treatment_variance[ok])
+results$reject[ok] <- abs(results$test_statistic[ok]) > critical_value
+invalid <- !results$test_evaluable | !results$reference_evaluable
+write_table(results[invalid, c("replicate", "scenario", "n", "method", "status", "error", "warnings",
+  "treatment_estimate", "treatment_variance", "mc_treatment_estimate", "source_file")], "invalid_rows.csv")
+if (any(invalid)) {
+  msg <- paste(sum(invalid), "rows contain failed/undefined tests or references; see invalid_rows.csv.")
+  if (params$invalid_policy == "stop") stop(msg) else warning(msg,
+    " Rates are conditional on evaluable tests where necessary; no variance is clipped or repaired.")
+}
+cat("Loaded", length(input_files), "file(s),", nrow(results), "rows, and",
+    length(unique(results$replicate)), "distinct repetition identifiers.\n")
+```
+
+## Variance and Type I error calculations
+
+The variance plot displays
+\[
+R_{a,n}=\frac{\operatorname{mean}(\widehat V_{\tau,a,n})}
+{\operatorname{var}(\widehat\tau^{\mathrm{MC}}_{a,n})}.
+\]
+` treatment_variance ` (or its alias `variance`) is already on the treatment-effect
+scale, $\widehat V_{\tau,a,n}=4\widehat\sigma_{a,\mathrm{adj}}^2/n$.
+**No extra factor of $4/n$ is applied.** The denominator is the sample variance of
+independent reference treatment-effect estimates, not the variance of the
+estimated variances.
+
+For positive $\overline V$ and $V_M$, the pointwise ratio interval is
+\[
+\frac{\overline V}{V_M}\exp\left\{\pm z_{(1+c)/2}
+\sqrt{(s_B/\overline V)^2+(s_M/V_M)^2}\right\},
+\]
+where $c$ is `mc_conf_level`, $s_B$ is the standard error of the mean estimated
+variance, and $s_M$ is the fourth-moment plug-in standard error of the reference
+sample variance, using the formula in the supplied simulation script.
+The original and reference sets are treated as independent, as constructed by
+the source. These are approximate Monte Carlo intervals, not exact intervals.
+
+For Type I error, this report explicitly applies a **two-sided normal-reference
+test** to the saved outputs:
+\[
+\left|\frac{\widehat\tau-\tau_0}{\sqrt{\widehat V_\tau}}\right|
+>\Phi^{-1}(1-\alpha/2).
+\]
+Each dataset uses its own feasible adjusted variance, not the Monte Carlo
+reference variance or an oracle variance. The default $\tau_0$ is zero and
+$\alpha=0.05$. The source saves estimates and variances, not rejection indicators;
+this testing rule is the analysis performed here. Binomial intervals are computed
+with `stats::binom.test()`.
+
+```{r summaries}
+#' Calculate a mean when observations are available
+#'
+#' Provide a scalar fallback for empty diagnostic subsets.
+#'
+#' @param x Numeric vector, already filtered to the observations to summarize.
+#' @return mean(x), or NA_real_ when x is empty.
+#' @details Does not remove missing values.
+mean_or_na <- function(x) if (length(x)) mean(x) else NA_real_
+#' Calculate a sample standard deviation when defined
+#'
+#' Provide a scalar fallback for subsets with fewer than two observations.
+#'
+#' @param x Numeric vector, already filtered to the observations to summarize.
+#' @return Sample standard deviation, or NA_real_ when length(x) < 2.
+#' @details Does not remove missing values.
+sd_or_na <- function(x) if (length(x) >= 2L) stats::sd(x) else NA_real_
+#' Calculate empirical quantiles with an empty-subset fallback
+#'
+#' Return unnamed quantiles for selected studentized-test diagnostics.
+#'
+#' @param x Numeric vector of selected observations.
+#' @param p Quantile probability or probabilities supplied to quantile().
+#' @return Unnamed numeric quantile vector, or scalar NA_real_ for an empty x.
+#' @details Uses the default quantile definition and does not remove missing values.
+q_or_na <- function(x, p) if (length(x)) unname(stats::quantile(x, p)) else NA_real_
+#' Estimate Monte Carlo uncertainty in the reference sample variance
+#'
+#' Apply the same fourth-moment plug-in calculation as vc_variance_se() in the simulation
+#' source.
+#'
+#' @param x Numeric vector of independent, finite reference treatment contrasts.
+#' @return Scalar standard error of var(x), or NA_real_ when fewer than four observations
+#'   are present.
+#' @details The fourth central moment estimates variance-of-variance uncertainty. This
+#'   quantity differs from sd(x)/sqrt(length(x)), which is the SE of a mean.
+variance_mcse <- function(x) {
+  # Matches vc_variance_se() in the supplied R source.
+  m <- length(x)
+  if (m < 4L) return(NA_real_)
+  v <- stats::var(x)
+  fourth <- mean((x - mean(x))^4)
+  sqrt(max(0, (fourth - (m - 3) / (m - 1) * v^2) / m))
+}
+sample_sizes <- sort(unique(results$n))
+grid <- expand.grid(scenario = selected_scenarios, n = sample_sizes,
+  method = method_levels, stringsAsFactors = FALSE)
+vs <- ts <- ds <- vector("list", nrow(grid))
+for (j in seq_len(nrow(grid))) {
+  cell <- grid[j, , drop = FALSE]
+  z <- results[results$scenario == cell$scenario & results$n == cell$n &
+               results$method == cell$method, , drop = FALSE]
+  v <- z$treatment_variance[z$variance_evaluable]
+  ref <- z$mc_treatment_estimate[z$reference_evaluable]
+  estimates <- z$treatment_estimate[z$estimate_evaluable]
+  R <- length(v); M <- length(ref)
+  # se_b is the SE of the mean variance estimate: sd(v)/sqrt(R), not sd(v) alone.
+  mv <- mean_or_na(v); se_b <- sd_or_na(v) / sqrt(R)
+  rv <- if (M >= 2L) stats::var(ref) else NA_real_
+  se_m <- variance_mcse(ref)
+  ratio <- lo <- hi <- log_se <- NA_real_
+  reason <- "Not enough original/reference results for a variance ratio"
+  if (R >= 1L && is.finite(rv) && rv > 0) {
+    ratio <- mv / rv
+    reason <- "Point estimate only; need >=2 original and >=4 reference results for an interval"
+    if (R >= 2L && M >= 4L && is.finite(se_b) && is.finite(se_m)) {
+      if (mv > 0) {
+        # Independent numerator/denominator contributions add on the log-ratio scale.
+        # Dividing each SE by its mean/variance converts it to relative uncertainty.
+        log_se <- sqrt((se_b / mv)^2 + (se_m / rv)^2)
+        lo <- exp(log(ratio) - normal_mc_quantile * log_se)
+        hi <- exp(log(ratio) + normal_mc_quantile * log_se)
+        reason <- "Log delta method; independent original/reference samples"
+      } else {
+        # A log interval is unavailable for a nonpositive numerator; use the linear delta
+        # formula.
+        ratio_se <- sqrt((se_b / rv)^2 + (mv * se_m / rv^2)^2)
+        lo <- ratio - normal_mc_quantile * ratio_se
+        hi <- ratio + normal_mc_quantile * ratio_se
+        reason <- "Linear delta method because mean estimated variance is nonpositive"
+      }
+    }
+  } else if (is.finite(rv) && rv == 0) reason <- "Zero reference treatment-effect variance; ratio undefined"
+  if (!is.finite(lo) || !is.finite(hi)) {
+    lo <- hi <- NA_real_
+    if (is.finite(ratio) && R >= 2L && M >= 4L) reason <- "Interval overflow/nonfinite; see original/reference summaries"
+  }
+  vs[[j]] <- data.frame(cell, datasets_loaded = nrow(z), outer_repetitions = R,
+    mc_repetitions = M, mean_estimated_variance = mv, mean_estimate_mcse = se_b,
+    reference_variance = rv, reference_mcse = se_m, variance_ratio = ratio,
+    ratio_lower = lo, ratio_upper = hi, log_ratio_mcse = log_se, interval_status = reason,
+    nonpositive_variances = sum(v <= 0), stringsAsFactors = FALSE)
+
+  # Undefined tests are excluded from the rate denominator and reported as invalid.
+  evaluable <- sum(z$test_evaluable); rejected <- sum(z$reject[z$test_evaluable])
+  invalid_tests <- nrow(z) - evaluable
+  rate <- if (evaluable) rejected / evaluable else NA_real_
+  ci <- if (evaluable) as.numeric(stats::binom.test(rejected, evaluable,
+    conf.level = params$mc_conf_level)$conf.int) else c(NA_real_, NA_real_)
+  # Binomial limits quantify MC uncertainty; all-loaded bounds instead allow either
+  # outcome for invalid tests.
+  ts[[j]] <- data.frame(cell, datasets_loaded = nrow(z), evaluable_tests = evaluable,
+    invalid_tests = invalid_tests, rejections = rejected, type1_error = rate,
+    lower = ci[1], upper = ci[2], alpha = params$alpha, null_value = params$null_value,
+    critical_value = critical_value,
+    all_loaded_rate_lower = if (nrow(z)) rejected / nrow(z) else NA_real_,
+    all_loaded_rate_upper = if (nrow(z)) (rejected + invalid_tests) / nrow(z) else NA_real_,
+    rate_interpretation = if (!nrow(z)) "No saved datasets" else if (invalid_tests)
+      "Conditional on an evaluable test" else "All loaded null datasets", stringsAsFactors = FALSE)
+  student <- z$test_statistic[z$test_evaluable]
+  errs <- estimates - params$null_value
+  # Diagnostic rows retain bias, studentization, failures, and a reference-scaled
+  # rejection check.
+  ds[[j]] <- data.frame(cell, datasets_loaded = nrow(z),
+    failed_status = sum(is.na(z$status) | z$status != "ok"),
+    finite_variance_estimates = R, finite_reference_estimates = M,
+    evaluable_tests = evaluable, nonpositive_variances = sum(v <= 0),
+    rows_with_warnings = sum(!is.na(z$warnings) & nzchar(z$warnings)),
+    estimate_bias = mean_or_na(errs), bias_mcse = sd_or_na(errs) / sqrt(length(errs)),
+    studentized_mean = mean_or_na(student), studentized_sd = sd_or_na(student),
+    studentized_q025 = q_or_na(student, 0.025), studentized_q975 = q_or_na(student, 0.975),
+    left_rejection_rate = if (length(student)) mean(student < -critical_value) else NA_real_,
+    right_rejection_rate = if (length(student)) mean(student > critical_value) else NA_real_,
+    reference_scaled_rejection_diagnostic = if (length(errs) && is.finite(rv) && rv > 0)
+      mean(abs(errs / sqrt(rv)) > critical_value) else NA_real_)
+}
+variance_summary <- do.call(rbind, vs)
+type1_summary <- do.call(rbind, ts)
+diagnostics <- do.call(rbind, ds)
+#' Sort numerical summary rows consistently
+#'
+#' Order scenario, sample size, and working model for CSV tables and diagnostics.
+#'
+#' @param x Data frame containing scenario, n, and method.
+#' @return Data frame with the same columns and rows in the requested order.
+#' @details Uses scenario_levels and method_levels from setup; row names are retained.
+order_rows <- function(x) x[order(match(x$scenario, scenario_levels), x$n,
+  match(x$method, method_levels)), , drop = FALSE]
+variance_summary <- order_rows(variance_summary)
+type1_summary <- order_rows(type1_summary)
+diagnostics <- order_rows(diagnostics)
+write_table(variance_summary, "treatment_effect_variance_ratio_summary.csv")
+write_table(type1_summary, "type1_error_summary.csv")
+write_table(diagnostics, "simulation_diagnostics.csv")
+write_table(diagnostics[diagnostics$scenario == "ii", ], "scenario_ii_diagnostics.csv")
+if (any(diagnostics$datasets_loaded == 0L)) warning("Some scenario/n/method cells are missing; they are not filled in.")
+if (any(!is.finite(variance_summary$ratio_lower))) warning(
+  "Some ratio intervals are unavailable. Points/intervals are drawn only when defined; see interval_status in the CSV.")
+if (any(diagnostics$datasets_loaded > 0 & diagnostics$datasets_loaded < 100L)) warning(
+  "Some cells have fewer than 100 saved repetitions. Type I error and variance comparisons may be very imprecise.")
+knitr::kable(diagnostics[, c("scenario", "n", "method", "datasets_loaded", "failed_status",
+  "finite_variance_estimates", "finite_reference_estimates", "evaluable_tests", "nonpositive_variances")],
+  caption = "Loaded and evaluable dataset counts")
+```
+
+A single `delta(i)` output contains one original and one independent reference
+trial per scenario/sample-size cell, analyzed with both working models. It is
+not enough to calculate a reference sampling variance. With too few repetitions,
+the report displays the available quantities and lists unavailable intervals,
+rather than fabricating a reference variance or aborting with an unexplained error.
+For Monte Carlo precision, compare the reported counts with your planned number
+of repetitions; completely absent seed files cannot be diagnosed from the files
+that are present.
+
+With `invalid_policy: "report"`, finite nonpositive estimates remain in the
+variance comparison, but their tests are **undefined**, not counted as
+non-rejections. Rates then condition on evaluable tests. Failures and warnings
+are saved separately. The `all_loaded_rate_lower` and `all_loaded_rate_upper`
+columns give logical bounds if undefined tests could have either outcome; they
+are not confidence intervals. Set `invalid_policy: "stop"` to stop when an invalid
+row is found. Source failures can also remove a reference estimate; summaries
+from retained runs should not be treated as unconditional performance when this occurs.
+
+## Variance ratios and Type I error
+
+```{r plot, fig.cap="Full treatment-effect variance ratios (upper row) and empirical Type I error (lower row). Shading connects pointwise Monte Carlo intervals, not simultaneous confidence bands."}
+#' Add ordered labels for figure facets and working models
+#'
+#' Prepare summary rows for the common ggplot scales and scenario layout.
+#'
+#' @param x Summary data frame containing scenario, method, and n.
+#' @return Data frame with scenario_label and method_label factors added, sorted by those
+#'   labels and n.
+#' @details Uses selected_scenarios, method_levels, and method_labels from setup.
+#'   Numerical estimates and intervals are unchanged.
+label_data <- function(x) {
+  x$scenario_label <- factor(x$scenario, levels = selected_scenarios,
+    labels = paste0("Scenario (", selected_scenarios, ")"))
+  x$method_label <- factor(x$method, levels = method_levels, labels = method_labels)
+  x[order(x$scenario_label, x$method_label, x$n), , drop = FALSE]
+}
+variance_plot_data <- label_data(variance_summary)
+type1_plot_data <- label_data(type1_summary)
+write_table(variance_plot_data, "treatment_effect_variance_ratio_plot_data.csv")
+write_table(type1_plot_data, "type1_error_plot_data.csv")
+
+# Match the two colours and the circle/triangle + solid/dashed encoding
+# in the supplied example. The same scales on both rows collect into one legend.
+method_colours <- setNames(c("#F8766D", "#00BFC4"), method_labels)
+plot_theme <- theme_bw(base_size = 13) + theme(
+  strip.background = element_rect(fill = "grey85", colour = "grey50", linewidth = 0.6),
+  strip.text = element_text(face = "bold", size = 14, margin = margin(6, 0, 6, 0)),
+  panel.grid.minor = element_blank(),
+  panel.spacing.x = grid::unit(0.8, "lines"),
+  axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 11),
+  axis.text.y = element_text(size = 11),
+  axis.title = element_text(size = 14),
+  axis.title.x = element_text(margin = margin(t = 8)),
+  axis.title.y = element_text(margin = margin(r = 8)),
+  legend.position = "bottom", legend.direction = "horizontal", legend.box = "horizontal",
+  legend.title = element_text(size = 13), legend.text = element_text(size = 12),
+  legend.key.width = grid::unit(1, "cm"),
+  plot.margin = margin(8, 8, 8, 8)
+)
+method_scales <- list(
+  scale_colour_manual(name = "Working model", values = method_colours,
+    limits = method_labels, drop = FALSE),
+  scale_fill_manual(name = "Working model", values = method_colours,
+    limits = method_labels, drop = FALSE),
+  scale_shape_manual(name = "Working model", limits = method_labels,
+    values = setNames(c(16, 17), method_labels), drop = FALSE),
+  scale_linetype_manual(name = "Working model", limits = method_labels,
+    values = setNames(c("solid", "dashed"), method_labels), drop = FALSE),
+  guides(fill = "none")
+)
+
+# Coordinate zooming changes only the visible range: it never removes values
+# before constructing the lines or intervals. Warn about anything out of range.
+#' Report values beyond a chosen display range
+#'
+#' Identify finite points or interval endpoints that coordinate zooming will hide.
+#'
+#' @param values Numeric vector of plot values and/or band endpoints.
+#' @param bounds Length-2 numeric vector of lower and upper visible limits.
+#' @param name Character plot name included in the warning.
+#' @return NULL invisibly; emits a warning if any finite values are outside the bounds.
+#' @details Does not filter, clip, or modify the plotted data or CSV summaries.
+warn_outside <- function(values, bounds, name) {
+  outside <- is.finite(values) & (values < bounds[1] | values > bounds[2])
+  if (any(outside)) warning(name, ": some points or band endpoints extend outside ",
+    paste(bounds, collapse = " to "), ". Enlarge the YAML axis range to see them. ",
+    "All numerical results remain unchanged in the CSV files.")
+}
+variance_bounds <- if (is.null(params$variance_y_min)) NULL else
+  c(params$variance_y_min, params$variance_y_max)
+finite_upper <- type1_summary$upper[is.finite(type1_summary$upper)]
+type1_top <- if (is.null(params$type1_y_max))
+  min(1, max(c(2 * params$alpha, finite_upper)) * 1.08) else params$type1_y_max
+conditional_rates <- any(type1_summary$invalid_tests > 0)
+
+# TOP ROW: full treatment-effect variance ratio, not the imbalance component.
+g_variance <- ggplot(variance_plot_data,
+  aes(n, variance_ratio, colour = method_label, shape = method_label,
+      linetype = method_label, group = method_label)) +
+  geom_ribbon(aes(x = n, ymin = ratio_lower, ymax = ratio_upper,
+    fill = method_label, group = method_label), inherit.aes = FALSE,
+    stat = "identity", position = "identity", alpha = params$band_alpha,
+    colour = NA, show.legend = FALSE, na.rm = TRUE) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "black", linewidth = 0.65) +
+  geom_line(linewidth = 0.85, na.rm = TRUE) + geom_point(size = 2.5, na.rm = TRUE) +
+  facet_wrap(~ scenario_label, nrow = 1, drop = FALSE) +
+  scale_x_continuous(breaks = sample_sizes, limits = range(sample_sizes),
+    expand = expansion(mult = 0.04)) +
+  scale_y_continuous(breaks = if (is.null(variance_bounds)) waiver() else
+    seq(variance_bounds[1], variance_bounds[2], by = 0.1),
+    #' Format variance axis labels
+    #'
+    #' Convert numeric tick positions into figure label strings.
+    #'
+    #' @param x Numeric vector of axis tick values.
+    #' @return Character vector of one-decimal labels.
+    labels = function(x) sprintf("%.1f", x), expand = expansion(mult = 0)) +
+  labs(x = NULL, y = "Treatment-effect variance ratio") + method_scales + plot_theme
+if (!is.null(variance_bounds)) {
+  g_variance <- g_variance + coord_cartesian(ylim = variance_bounds)
+  warn_outside(unlist(variance_plot_data[c("variance_ratio", "ratio_lower", "ratio_upper")]),
+    variance_bounds, "Variance display")
+}
+
+# BOTTOM ROW: two-sided normal-reference tests using each trial's saved variance.
+g_type1 <- ggplot(type1_plot_data,
+  aes(n, type1_error, colour = method_label, shape = method_label,
+      linetype = method_label, group = method_label)) +
+  geom_ribbon(aes(x = n, ymin = lower, ymax = upper, fill = method_label, group = method_label),
+    inherit.aes = FALSE, stat = "identity", position = "identity",
+    alpha = params$band_alpha, colour = NA, show.legend = FALSE, na.rm = TRUE) +
+  geom_hline(yintercept = params$alpha, linetype = "dashed", colour = "black", linewidth = 0.65) +
+  geom_line(linewidth = 0.85, na.rm = TRUE) + geom_point(size = 2.5, na.rm = TRUE) +
+  facet_wrap(~ scenario_label, nrow = 1, drop = FALSE) +
+  scale_x_continuous(breaks = sample_sizes, limits = range(sample_sizes),
+    expand = expansion(mult = 0.04)) +
+  scale_y_continuous(breaks = if (type1_top <= 0.13) seq(0, type1_top, by = 0.03) else waiver(),
+    #' Format percentage axis labels
+    #'
+    #' Convert numeric tick positions into figure label strings.
+    #'
+    #' @param x Numeric vector of axis tick values.
+    #' @return Character vector of one-decimal percentages, after multiplying values by
+    #'   100.
+    labels = function(x) sprintf("%.1f%%", 100 * x), expand = expansion(mult = 0)) +
+  coord_cartesian(ylim = c(0, type1_top)) +
+  labs(x = "Sample size", y = if (conditional_rates)
+    "Rejection rate among evaluable tests" else "Empirical Type I error") +
+  method_scales + plot_theme
+warn_outside(unlist(type1_plot_data[c("type1_error", "lower", "upper")]),
+  c(0, type1_top), "Type I error display")
+
+# Object requested for interactive use: run this chunk, then enter g2.
+g2 <- patchwork::wrap_plots(g_variance, g_type1, ncol = 1,
+  heights = c(1, 1), guides = "collect")
+g2 <- g2 & theme(legend.position = "bottom")
+combined_plot <- g2  # Keep the earlier name as an alias.
+print(g2)
+
+#' Export a ggplot or combined patchwork figure
+#'
+#' Save the displayed figure as a high-resolution PNG and optionally PDF.
+#'
+#' @param p ggplot or patchwork plot object.
+#' @param name Character output basename without an extension.
+#' @param width Figure width in inches; default 12.
+#' @param height Figure height in inches; default 9.
+#' @return PDF filename invisibly when a PDF is saved, otherwise NULL invisibly. Always
+#'   writes name.png and, when enabled, name.pdf.
+#' @details Uses output_path and params$save_pdf. PNG output is 400 DPI with a white
+#'   background; PDFs disable Dingbats fonts.
+save_plot <- function(p, name, width = 12, height = 9) {
+  ggplot2::ggsave(file.path(output_path, paste0(name, ".png")), plot = p,
+    width = width, height = height, units = "in", dpi = 400, bg = "white")
+  if (isTRUE(params$save_pdf)) ggplot2::ggsave(file.path(output_path, paste0(name, ".pdf")),
+    plot = p, width = width, height = height, units = "in",
+    device = grDevices::pdf, useDingbats = FALSE, bg = "white")
+}
+save_plot(g2, "variance_ratio_type1_conditionalX2_gexp")
+save_plot(g_variance, "treatment_effect_variance_ratio_bands", height = 4.2)
+save_plot(g_type1, "type1_error_bands", height = 4.6)
+if (isTRUE(params$save_plot_object)) saveRDS(g2, file.path(output_path, "g2.rds"))
+```
+
+
+The horizontal reference is **one** for the variance ratio and
+**`r sprintf('%.1f%%', 100 * params$alpha)`** for Type I error. Standard-normal
+critical values are used for both working-model estimators in this report.
+The confidence level is **`r sprintf('%.0f%%', 100 * params$mc_conf_level)`**.
+
+The default variance axis is **0.7 to 1.2**, and the Type I error axis is
+**0 to 11.5%**, matching the example. Change `variance_y_min: 0.6` for a wider
+variance display. Set both variance limits to `null`, or `type1_y_max: null`,
+for automatic ranges. Coordinate zooming does not change estimates or intervals;
+a warning identifies any hidden endpoints. `band_alpha` controls transparency.
+To show only one scenario, use, for example, `scenarios: ["iii"]`.
+
+### Display the figure as `g2` in the console
+
+Running this Rmd's chunks interactively creates `g2` in the current R session.
+Knitting in RStudio normally uses a separate session, so knitting alone need not
+create a console object. The report also saves `g2.rds`. After knitting, run:
+
+```{r display-g2-later, eval=FALSE}
+library(ggplot2)
+library(patchwork)
+g2 <- readRDS("variance_type1_conditionalX2_gexp_plots/g2.rds")
+g2
+```
+
+These paths assume the console working directory is the folder containing the
+Rmd. Loading `g2.rds` neither reads the seed files again nor reruns the simulation.
+
+## Numerical summaries
+
+```{r numerical-tables}
+knitr::kable(variance_summary[, c("scenario", "n", "method", "outer_repetitions", "mc_repetitions",
+  "mean_estimated_variance", "reference_variance", "variance_ratio", "ratio_lower", "ratio_upper")],
+  digits = 5, caption = "Full treatment-effect variance: estimated mean, reference variance, and ratio")
+knitr::kable(type1_summary[, c("scenario", "n", "method", "evaluable_tests", "invalid_tests",
+  "rejections", "type1_error", "lower", "upper")], digits = 4,
+  caption = "Rejection rates and pointwise binomial intervals")
+knitr::kable(diagnostics[, c("scenario", "n", "method", "estimate_bias", "bias_mcse",
+  "studentized_mean", "studentized_sd", "left_rejection_rate", "right_rejection_rate")],
+  digits = 4, caption = "Additional studentized-test diagnostics")
+```
+
+These diagnostics do not identify a cause of miscalibration by themselves.
+Agreement of an average variance with a sampling variance does not guarantee
+calibration of dataset-specific studentized statistics. The CSV also records
+`reference_scaled_rejection_diagnostic`, using a common independent reference
+standard deviation instead of estimated dataset-specific denominators. This is
+an **infeasible diagnostic**, not a replacement test; its reference standard
+deviation is itself estimated.
+
+## Saved files and reproducibility
+
+The output directory is **`r output_path`**. It contains the combined figure,
+separate row figures, ratio and rejection-rate CSV summaries, pointwise plot data,
+input/settings records, and failure/calibration diagnostics. Input data files
+are never overwritten.
+
+```{r record-settings}
+settings <- data.frame(setting = c("results_dir", "output_dir", "scenarios", "n_min", "n_max",
+  "alpha", "null_value", "mc_conf_level", "band_alpha", "invalid_policy", "check_scenario2_settings",
+  "test_rule", "variance_scale", "ratio_interval", "variance_y_min", "variance_y_max",
+  "type1_y_max", "expected_study"),
+  value = c(input_path, output_path, paste(selected_scenarios, collapse = ","),
+    as.character(params$n_min), as.character(params$n_max), as.character(params$alpha),
+    as.character(params$null_value), as.character(params$mc_conf_level), as.character(params$band_alpha),
+    params$invalid_policy, as.character(params$check_scenario2_settings),
+    "Two-sided normal test using each dataset's saved treatment_variance",
+    "Raw treatment-effect variance already includes 4/n; ratio cancels common scaling",
+    "Log delta method with independent numerator/denominator uncertainty",
+    if (is.null(params$variance_y_min)) "automatic" else as.character(params$variance_y_min),
+    if (is.null(params$variance_y_max)) "automatic" else as.character(params$variance_y_max),
+    if (is.null(params$type1_y_max)) "automatic" else as.character(params$type1_y_max),
+    expected_study))
+write_table(settings, "analysis_settings.csv")
+writeLines(capture.output(sessionInfo()), file.path(output_path, "sessionInfo.txt"))
+```
+
+### Source and calculation notes
+
+Input structure, variance scaling, settings, and the fourth-moment reference
+variance standard error follow the attached
+`simu_variance_one_seed_2100_s2_conditionalX2_gexp_order3_knot0.R`, specifically
+`vc_outer_one()`, `vc_variance_se()`, `vc_metadata()`, `delta()`, and `vc_write_rdata()`.
+The report adds the explicitly specified normal-reference tests and Monte Carlo
+interval calculations. It does not modify any estimator or simulation scenario.
+
+Software documentation: [binom.test](https://stat.ethz.ch/R-manual/R-devel/library/stats/html/binom.test.html),
+[geom_ribbon](https://ggplot2.tidyverse.org/reference/geom_ribbon.html), and
+[patchwork::wrap_plots](https://patchwork.data-imaginist.com/reference/wrap_plots.html).

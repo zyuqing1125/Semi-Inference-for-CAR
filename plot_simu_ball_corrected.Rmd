@@ -1,0 +1,359 @@
+---
+title: "All-covariate balancing: type I error and power"
+output:
+  html_document:
+    toc: false
+    self_contained: true
+    code_folding: hide
+params:
+  data_dir: "."
+  object_name: "res1"
+  allow_missing: false
+---
+
+This report is specifically for results from **`simu_ball_corrected_s2_conditionalX2_gexp.R`**.
+Place this RMarkdown file in the folder containing your `seed*.RData` files,
+then click **Knit** in RStudio. Each file should contain the numeric `res1`
+vector returned by `delta()`, with all three scenarios and effects
+0, 0.1, 0.2, and 0.3. No simulations are rerun by this document.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = TRUE,
+                     fig.width = 10, fig.height = 3.8, dpi = 150, error = FALSE)
+if (!requireNamespace("ggplot2", quietly = TRUE)) {
+  stop('Install ggplot2 first: install.packages("ggplot2")')
+}
+library(ggplot2)
+```
+
+```{r settings}
+# SETTINGS: normally these do not need changing.
+# Inputs: one independent seed file per row; every file stores the same n,
+# effect order, simulation settings, and 132-entry delta() layout.
+# Outputs: results is a replicate-by-132 matrix; power_data contains one
+# row per scenario/method/effect; figures and CSV audits use output_dir.
+# Relative paths are relative to this RMarkdown file when knitted normally.
+data_dir = params$data_dir
+file_pattern = "^seed.*\\.(RData|rda|rds)$"
+object_name = params$object_name         # object saved by job_run.R inside each .RData file
+u = c(0, 0.1, 0.2, 0.3)    # must match the order used when delta() was run
+alpha = 0.05
+allow_missing = params$allow_missing       # compatibility setting; this report counts available entries
+output_dir = file.path(data_dir, "figures_ball_corrected")
+
+# Each list contains positions WITHIN the 44-entry scenario block.
+common_indices = list(
+  "Proposed-plm" = 17:20,
+  "Proposed-t-test" = c(1, 3, 5, 7),
+  "Proposed-lm" = c(9, 11, 13, 15),
+  "Naive-t-test" = c(2, 4, 6, 8),
+  "Naive-lm" = c(10, 12, 14, 16)
+)
+method_indices = list(
+  c(common_indices, list("Ma2022mr"=25:28, "Ma2015lm"=41:44, "Ye2018plm"=33:36)),
+  c(common_indices, list("Ma2022mr"=41:44, "Ma2015lm"=25:28, "Ye2018plm"=33:36)),
+  c(common_indices, list("Ma2022mr"=25:28, "Ma2015lm"=41:44, "Ye2018plm"=33:36))
+)
+method_functions = list(
+  c("Proposed-plm"="testbs3.dis", "Proposed-t-test"="testbs1.dis (adjusted)",
+    "Proposed-lm"="testbs2.dis (adjusted)", "Naive-t-test"="testbs1.dis (naive)",
+    "Naive-lm"="testbs2.dis (naive)", "Ma2022mr"="ftest2.dis",
+    "Ma2015lm"="fftest2.dis", "Ye2018plm"="testye2.dis"),
+  c("Proposed-plm"="testbs3.ind", "Proposed-t-test"="testbs1.ind (adjusted)",
+    "Proposed-lm"="testbs2.ind (adjusted)", "Naive-t-test"="testbs1.ind (naive)",
+    "Naive-lm"="testbs2.ind (naive)", "Ma2022mr"="fftest2.mf.ind",
+    "Ma2015lm"="fftest2.ind", "Ye2018plm"="testye2.ind"),
+  c("Proposed-plm"="testbs3.ts", "Proposed-t-test"="testbs1.ts (adjusted)",
+    "Proposed-lm"="testbs2.ts (adjusted)", "Naive-t-test"="testbs1.ts (naive)",
+    "Naive-lm"="testbs2.ts (naive)", "Ma2022mr"="ftest2.c3",
+    "Ma2015lm"="fftest2.ts", "Ye2018plm"="testye2.ts")
+)
+
+```
+
+```{r read-data}
+files = list.files(data_dir, pattern = file_pattern,
+                   full.names = TRUE, ignore.case = TRUE)
+if (length(files) == 0L) {
+  stop("No seed*.RData / seed*.rda / seed*.rds files found in: ",
+       normalizePath(data_dir),
+       ". Put this Rmd beside the result files, or edit data_dir/file_pattern.")
+}
+# Sort seed numbers for a readable input manifest; averaging is order invariant.
+seed_text = sub("^seed([0-9]+).*", "\\1", basename(files), ignore.case = TRUE)
+seed_number = suppressWarnings(as.numeric(seed_text))
+file_order = order(seed_number, basename(files), na.last = TRUE)
+files = files[file_order]
+# The filename stems provide a second duplicate check across RData/RDS formats.
+stems = tolower(tools::file_path_sans_ext(basename(files)))
+canonical = sub("^seed0*([0-9]+)$", "seed\\1", stems)
+if (anyDuplicated(canonical)) {
+  stop("Duplicate seed filenames detected (possibly both RData and RDS copies).",
+       " Keep only one result file per simulation replicate.")
+}
+if (length(u) != 4L || any(!is.finite(u)) || anyDuplicated(u)) {
+  stop("This report expects four distinct finite effects in the saved delta() order.")
+}
+# delta() returns 44 entries per scenario: 8+8+4+4+4+4+4+4+4.
+expected_length = 132L
+#' Read and validate one saved simulation replicate
+#'
+#' Load the result vector from an RDS file or from object_name inside an RData/rda file,
+#' using a private environment for the latter.
+#'
+#' @param path Character scalar path to one seed result file.
+#' @return Length-expected_length numeric vector with entries 0, 1, or NA, ready to
+#'   become one row of results. Missing objects, invalid lengths, batch matrices, or
+#'   nonbinary finite values cause an error.
+#' @details Uses object_name and expected_length from the report settings. A one-column
+#'   matrix is accepted and flattened; no simulation is rerun.
+read_one = function(path) {
+  if (tolower(tools::file_ext(path)) == "rds") {
+    value = readRDS(path)
+  } else {
+    env = new.env(parent = emptyenv())
+    objects = load(path, envir = env)
+    if (!(object_name %in% objects)) {
+      stop(basename(path), " does not contain '", object_name,
+           "'. Objects found: ", paste(objects, collapse = ", "))
+    }
+    value = env[[object_name]]
+  }
+  if (!is.numeric(value) || length(value) != expected_length ||
+      (!is.null(dim(value)) && sum(dim(value) > 1L) > 1L)) {
+    stop(basename(path), ": expected one numeric length-132 delta() vector.",
+         " Do not mix summaries, batch matrices, or other simulation outputs.")
+  }
+  value = as.numeric(value)
+  if (any(!is.na(value) & !(value %in% c(0, 1)))) {
+    stop(basename(path), ": entries must be rejection indicators 0/1 (or NA).")
+  }
+  value
+}
+# Stack validated vectors without changing their within-scenario ordering.
+results = do.call(rbind, lapply(files, read_one))
+rownames(results) = basename(files)
+# Identify plotted columns and audit missing entries across ALL saved columns.
+# Column callback: input scenario is an integer from 1 to 3; output is
+# the global delta() column numbers used by that scenario in these plots.
+plotted_columns = sort(unique(unlist(lapply(1:3, function(scenario)
+  (scenario - 1L) * 44L + unlist(method_indices[[scenario]], use.names = FALSE)))))
+missing_by_column = data.frame(
+  Delta_index = seq_len(ncol(results)),
+  Scenario = (seq_len(ncol(results)) - 1L) %/% 44L + 1L,
+  Within_scenario_index = (seq_len(ncol(results)) - 1L) %% 44L + 1L,
+  Used_in_plots = seq_len(ncol(results)) %in% plotted_columns,
+  Missing = colSums(is.na(results)),
+  Available = colSums(!is.na(results)))
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+write.csv(missing_by_column, file.path(output_dir, "missing_results_by_column.csv"),
+          row.names = FALSE)
+missing_total = sum(is.na(results))
+missing_plotted = sum(is.na(results[, plotted_columns, drop = FALSE]))
+
+manifest = data.frame(file = basename(files),
+                      missing_entries = rowSums(is.na(results)))
+write.csv(manifest, file.path(output_dir, "input_manifest.csv"), row.names = FALSE)
+```
+
+The complete saved output contains **`r missing_total` missing entries**, of which
+**`r missing_plotted` belong to methods used in these plots**. Missing values in
+unplotted methods do not exclude any datasets from the plotted methods. All 132
+columns are audited in `figures_ball_corrected/missing_results_by_column.csv`.
+
+## Reading the saved output
+
+`r nrow(results)` result files were loaded. Each file is treated as one independent
+simulation replicate. Do not combine files produced with different sample sizes,
+data-generating mechanisms, or tuning settings in the same report. These settings are
+not encoded in an unnamed `res1` vector and cannot be checked automatically.
+
+The mapping follows `delta()` in `simu_ball_corrected_s2_conditionalX2_gexp.R`. **Scenario 2 has a
+different comparator order:** `Ma2022mr` uses positions 41--44 and `Ma2015lm`
+uses 25--28 within its scenario block. In Scenarios 1 and 3 these positions
+are reversed. `Ye2018plm` uses 33--36 in all scenarios. The unadjusted comparison
+variants in positions 21--24, 29--32, and 37--40 are not plotted.
+
+An unnamed length-132 vector cannot identify its generating code or settings.
+Use only files from the corrected all-covariate simulation, with the same n
+and tuning choices. No externally supplied values replace any saved results.
+
+```{r method-mapping}
+# Mapping callback: input scenario is an integer from 1 to 3; output is
+# one data frame of method names, local/global indices, and function names.
+mapping_table = do.call(rbind, lapply(1:3, function(scenario) {
+  indices = method_indices[[scenario]]
+  data.frame(
+    Scenario = paste("Scenario", scenario),
+    Method = names(indices),
+    Within_scenario_indices = vapply(indices, paste, collapse = ", ", FUN.VALUE = character(1)),
+    # Index-format callback: input x is the four local effect indices;
+    # output is one character string listing their global delta() positions.
+    Delta_indices = vapply(indices, function(x) paste((scenario-1L)*44L+x, collapse=", "), character(1)),
+    Function = unname(method_functions[[scenario]][names(indices)]),
+    row.names = NULL
+  )
+}))
+write.csv(mapping_table, file.path(output_dir, "method_mapping.csv"), row.names = FALSE)
+knitr::kable(mapping_table, row.names = FALSE)
+```
+
+```{r summarize-data}
+# For each saved column, divide rejection count by its available replicates.
+# MCSE is sqrt(p_hat * (1-p_hat) / R_valid), the SE of the outer simulation mean.
+# Exact 95% binomial limits describe Monte Carlo uncertainty in that rate.
+summary_rows = list()
+k = 0L
+for (scenario in 1:3) {
+  for (method in names(method_indices[[scenario]])) {
+    for (j in seq_along(u)) {
+      column = (scenario - 1L) * 44L + method_indices[[scenario]][[method]][j]
+      values = results[, column]
+      n_valid = sum(!is.na(values))
+      if (n_valid == 0L) {
+        stop("No valid results for Scenario ", scenario, ", ", method,
+             ", effect = ", u[j])
+      }
+      rejected = sum(values, na.rm = TRUE)
+      estimate = rejected / n_valid
+      # Exact binomial intervals remain informative at observed rates 0 and 1.
+      interval = binom.test(rejected, n_valid, conf.level = 0.95)$conf.int
+      k = k + 1L
+      summary_rows[[k]] = data.frame(
+        Scenario = paste("Scenario", scenario),
+        Method = method, Effect = u[j], Power = estimate,
+        Rejections = rejected, Replicates = n_valid,
+        Missing = length(values) - n_valid,
+        MCSE = sqrt(estimate * (1 - estimate) / n_valid),
+        MC_lower = interval[1], MC_upper = interval[2],
+        Delta_index = column
+      )
+    }
+  }
+}
+# Assemble the summaries and retain the source Delta_index for traceability.
+power_data = do.call(rbind, summary_rows)
+power_data$Scenario = factor(power_data$Scenario,
+                             levels = paste("Scenario", 1:3))
+write.csv(power_data, file.path(output_dir, "power_summary.csv"), row.names = FALSE)
+```
+
+At zero effect the rejection rate estimates **type I error**. At nonzero effects
+it estimates **power**. The blue horizontal line marks the nominal 5% level.
+Monte Carlo intervals and the number of valid replicates are saved in
+`figures_ball_corrected/power_summary.csv`; intervals are omitted from the figures to match the
+provided examples. An estimated MCSE of zero at an observed rate of 0 or 1 does
+not mean there is no uncertainty; use the exact interval columns in that case.
+
+```{r plot-theme}
+# Reuse the same axes, facet strips, and legend appearance in both figures.
+common_theme = theme_bw(base_size = 12) +
+  theme(
+    strip.background = element_rect(fill = "#D9D9D9", colour = "#888888"),
+    strip.text = element_text(size = 12, colour = "black"),
+    panel.border = element_rect(colour = "#888888", fill = NA),
+    panel.grid.major = element_line(colour = "#EAEAEA", linewidth = 0.4),
+    panel.grid.minor = element_line(colour = "#F3F3F3", linewidth = 0.25),
+    panel.spacing.x = grid::unit(0.12, "in"),
+    axis.text = element_text(colour = "#555555"),
+    axis.title = element_text(colour = "black"),
+    legend.position = "right",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    legend.key.width = grid::unit(0.65, "cm"),
+    plot.margin = margin(6, 6, 6, 6)
+  )
+
+#' Build the common faceted power-plot layout
+#'
+#' Create the shared ggplot before the caller adds method-specific colours, shapes, and
+#' line types.
+#'
+#' @param data Summary data frame with Effect (numeric treatment effect), Power
+#'   (rejection rate), Method (method label), and Scenario (facet label).
+#' @return A ggplot object with method lines and points, one facet per scenario, and a
+#'   horizontal reference at alpha. The function does not save the plot.
+#' @details Uses alpha, u, and common_theme from the surrounding report. At Effect = 0,
+#'   Power is the empirical type I error. MCSE and binomial intervals remain in the
+#'   summary table; this plot uses point estimates.
+base_plot = function(data) {
+  ggplot(data, aes(x = Effect, y = Power, colour = Method,
+                   linetype = Method, shape = Method, group = Method)) +
+    geom_hline(yintercept = alpha, colour = "blue", linewidth = 0.45) +
+    geom_line(linewidth = 0.65) +
+    geom_point(size = 1.9, stroke = 0.65) +
+    facet_wrap(~ Scenario, nrow = 1) +
+    scale_x_continuous(breaks = u, labels = sprintf("%.1f", u),
+                       expand = expansion(mult = 0.035)) +
+    scale_y_continuous(breaks = seq(0, 1, 0.25),
+                       labels = sprintf("%.2f", seq(0, 1, 0.25)),
+                       expand = expansion(mult = 0)) +
+    coord_cartesian(ylim = c(-0.025, 1.025)) +
+    labs(x = expression(u[2] - u[1]), y = "Power",
+         colour = "Method", linetype = "Method", shape = "Method") +
+    common_theme
+}
+```
+
+## Proposed methods and naive tests
+
+```{r figure-one}
+methods_1 = c("Proposed-plm", "Proposed-t-test", "Proposed-lm",
+              "Naive-t-test", "Naive-lm")
+data_1 = power_data[power_data$Method %in% methods_1, ]
+data_1$Method = factor(data_1$Method, levels = methods_1)
+
+plot_1 = base_plot(data_1) +
+  scale_colour_manual(values = c(
+    "Proposed-plm" = "#F8766D", "Proposed-t-test" = "#00BFC4",
+    "Proposed-lm" = "#E5A44A", "Naive-t-test" = "#C77CFF",
+    "Naive-lm" = "#FFB3BA"), breaks = methods_1) +
+  scale_linetype_manual(values = c("solid", "solid", "solid", "dashed", "dashed"),
+                        breaks = methods_1) +
+  scale_shape_manual(values = rep(16, 5), breaks = methods_1)
+plot_1
+```
+
+## Proposed PLM and comparison methods
+
+```{r figure-two}
+methods_2 = c("Proposed-plm", "Ma2022mr", "Ma2015lm", "Ye2018plm")
+data_2 = power_data[power_data$Method %in% methods_2, ]
+data_2$Method = factor(data_2$Method, levels = methods_2)
+
+plot_2 = base_plot(data_2) +
+  scale_colour_manual(values = c(
+    "Proposed-plm" = "#F8766D", "Ma2022mr" = "#FDAE6B",
+    "Ma2015lm" = "#4DB6AC", "Ye2018plm" = "#607D8B"), breaks = methods_2) +
+  scale_linetype_manual(values = c("solid", "dashed", "dashed", "dashed"),
+                        breaks = methods_2) +
+  scale_shape_manual(values = rep(16, 4), breaks = methods_2)
+plot_2
+```
+
+```{r save-figures, include=FALSE}
+# Edit width/height here if your manuscript requires different dimensions.
+for (ext in c("png", "pdf")) {
+  ggsave(file.path(output_dir, paste0("proposed_vs_naive.", ext)),
+         plot = plot_1, width = 10, height = 3.8, units = "in",
+         dpi = 300, bg = "white")
+  ggsave(file.path(output_dir, paste0("proposed_vs_comparators.", ext)),
+         plot = plot_2, width = 10, height = 3.8, units = "in",
+         dpi = 300, bg = "white")
+}
+```
+
+## Type I error at zero effect
+
+```{r type-i-table}
+null_results = power_data[power_data$Effect == 0,
+  c("Scenario", "Method", "Power", "Rejections", "Replicates", "Missing",
+    "MC_lower", "MC_upper")]
+names(null_results)[names(null_results) == "Power"] = "Type_I_error"
+knitr::kable(null_results, digits = 4, row.names = FALSE)
+```
+
+The two PNGs, two PDFs, summary CSV, method-mapping CSV, and input manifest are saved in the
+`figures_ball_corrected` subfolder. Curve values are calculated from your result files, not
+copied from the reference images. The x-axis shows the absolute treatment-effect difference, consistent with the
+nonnegative effect values and two-sided tests.
