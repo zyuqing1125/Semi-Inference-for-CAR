@@ -23,10 +23,6 @@ library(ggplot2)
 
 ```{r settings}
 # SETTINGS: normally these do not need changing.
-# Inputs: one independent seed file per row; every file stores the same n,
-# effect order, simulation settings, and 132-entry delta() layout.
-# Outputs: results is a replicate-by-132 matrix; power_data contains one
-# row per scenario/method/effect; figures and CSV audits use output_dir.
 # Relative paths are relative to this RMarkdown file when knitted normally.
 data_dir = "."
 file_pattern = "^seed.*\\.(RData|rda|rds)$"
@@ -74,17 +70,6 @@ if (length(u) != 4L || any(!is.finite(u)) || anyDuplicated(u)) {
 }
 # delta() returns 44 entries per scenario: 8+8+4+4+4+4+4+4+4.
 expected_length = 132L
-#' Read and validate one saved simulation replicate
-#'
-#' Load the result vector from an RDS file or from object_name inside an RData/rda file,
-#' using a private environment for the latter.
-#'
-#' @param path Character scalar path to one seed result file.
-#' @return Length-expected_length numeric vector with entries 0, 1, or NA, ready to
-#'   become one row of results. Missing objects, invalid lengths, batch matrices, or
-#'   nonbinary finite values cause an error.
-#' @details Uses object_name and expected_length from the report settings. A one-column
-#'   matrix is accepted and flattened; no simulation is rerun.
 read_one = function(path) {
   if (tolower(tools::file_ext(path)) == "rds") {
     value = readRDS(path)
@@ -108,12 +93,9 @@ read_one = function(path) {
   }
   value
 }
-# Stack validated vectors without changing their within-scenario ordering.
 results = do.call(rbind, lapply(files, read_one))
 rownames(results) = basename(files)
 # Validate only columns used in the requested plots; audit ALL saved columns.
-# Column callback: input scenario is a zero-based block number (0, 1, 2);
-# output is the global delta() column numbers used by that block in these plots.
 plotted_columns = sort(unique(unlist(lapply(0:2, function(scenario)
   scenario * 44L + unlist(method_indices, use.names = FALSE)))))
 missing_by_column = data.frame(
@@ -159,7 +141,7 @@ bootstrap algorithms, or tuning settings in the same report. These settings are
 not encoded in an unnamed `res1` vector and cannot be checked automatically.
 
 The method mapping below follows the `delta()` return order in
-`simu_updated_empirical_bootstrap_s2_conditionalX2_gexp.R`.
+`simu_updated.R` and the method labels in the original `updated_car.Rmd`.
 The comparison figure uses the regression variants labeled `Ma2015lm`,
 `Ma2022mr`, and `Ye2018plm` in that original plotting file. The preceding
 variants, labeled with a `-t` suffix there, are different tests and are omitted
@@ -196,9 +178,6 @@ knitr::kable(mapping_table, row.names = FALSE)
 ```
 
 ```{r summarize-data}
-# For each saved column, divide rejection count by its available replicates.
-# MCSE is sqrt(p_hat * (1-p_hat) / R_valid), the SE of the outer simulation mean.
-# Exact 95% binomial limits describe Monte Carlo uncertainty in that rate.
 summary_rows = list()
 k = 0L
 for (scenario in 1:3) {
@@ -228,7 +207,6 @@ for (scenario in 1:3) {
     }
   }
 }
-# Assemble the summaries and retain the source Delta_index for traceability.
 power_data = do.call(rbind, summary_rows)
 power_data$Scenario = factor(power_data$Scenario,
                              levels = paste("Scenario", 1:3))
@@ -243,7 +221,6 @@ provided examples. An estimated MCSE of zero at an observed rate of 0 or 1 does
 not mean there is no uncertainty; use the exact interval columns in that case.
 
 ```{r plot-theme}
-# Reuse the same axes, facet strips, and legend appearance in both figures.
 common_theme = theme_bw(base_size = 12) +
   theme(
     strip.background = element_rect(fill = "#D9D9D9", colour = "#888888"),
@@ -261,18 +238,6 @@ common_theme = theme_bw(base_size = 12) +
     plot.margin = margin(6, 6, 6, 6)
   )
 
-#' Build the common faceted power-plot layout
-#'
-#' Create the shared ggplot before the caller adds method-specific colours, shapes, and
-#' line types.
-#'
-#' @param data Summary data frame with Effect (numeric treatment effect), Power
-#'   (rejection rate), Method (method label), and Scenario (facet label).
-#' @return A ggplot object with method lines and points, one facet per scenario, and a
-#'   horizontal reference at alpha. The function does not save the plot.
-#' @details Uses alpha, u, and common_theme from the surrounding report. At Effect = 0,
-#'   Power is the empirical type I error. MCSE and binomial intervals remain in the
-#'   summary table; this plot uses point estimates.
 base_plot = function(data) {
   ggplot(data, aes(x = Effect, y = Power, colour = Method,
                    linetype = Method, shape = Method, group = Method)) +
