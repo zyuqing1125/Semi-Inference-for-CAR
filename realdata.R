@@ -1,6 +1,10 @@
 #' Reproduce the CBASP data application
 #'
-#' Run this file with Rscript realdata.R, or source it and call rd_reproduce().
+#' Run this file with Rscript realdata.R, or source it and call rd_reproduce(). Input:
+#' source("realdata.R")
+#' ans <- rd_reproduce(repetitions = 1000, seed_start = 1, sigma = 2, strata = 4)
+#' ans$table
+
 #' Defaults match the supplied manuscript: 453 fixed observed baseline profiles,
 #' noise SD 2, 1000 independent simulation seeds, quadratic age splines with a
 #' fixed interior knot zero, and four age strata for comparison allocations.
